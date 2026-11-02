@@ -100,7 +100,7 @@ static void saveLook(int64_t id, const Look& k) {
 static uintptr_t cActor, cWords, cMesh, cVeh, fAdd, fFinish, fMobility, fCollision, fShadow, fSetMesh, fMid, fMidColor;
 static uintptr_t fToText, textCDO, fWords, fWorldSize, fInk, fAlignX, fAlignY, fTall, fRelLoc, fRelScale, fShow, fParent;
 static uintptr_t fToName, stringCDO, fPath, fRef, fLoad, systemCDO, cubeMaterial;
-static uintptr_t fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits;
+static uintptr_t fGetMaterial, fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits;
 static int oStaticMesh = -1, oEngine = -1, oHot = -1, oRpm = -1;
 static uint64_t colorName;
 static int oId = -1, oRelLoc;
@@ -109,7 +109,7 @@ static int pTextIn, pTextRet;
 // the one fitted: GetLocalBounds, not numbers from one plate. All of them are centred on the actor.
 static const double BORDER = 0.75, BAND_WIDE = 3, BAND_HIGH = 2.4, PROUD = 0.06, REFERENCE_HALF_HEIGHT = 6.56;  // cm
 
-struct Box { Ref c; uintptr_t mid; };
+struct Box { Ref c, mid; };
 struct Plate { Ref actor; Box border, blank, band[2]; Ref text[2][4], lamp[2]; std::wstring shown; double middle[3], half[3]; int lit; };
 static std::map<uintptr_t, Plate> plates;
 static std::vector<Ref> waiting, screens;
@@ -132,6 +132,8 @@ static uintptr_t loadAsset(const wchar_t* path) {
 }
 
 static Ref refOf(uintptr_t o) { return {o ? get<int>(o + L().obj_index) : 0, o}; }
+// In the object table but being destroyed, which alive() alone cannot see.
+static bool usable(const Ref& r) { return alive(r) && !(get<uint32_t>(r.ptr + L().obj_flags) & 0x18000); }
 
 static Box makeBox(uintptr_t actor, uintptr_t mesh) {
     Box box = {};
@@ -162,7 +164,9 @@ static Box makeBox(uintptr_t actor, uintptr_t mesh) {
     unsigned char d[0x30] = {0};
     memcpy(d + off(fMid, "SourceMaterial"), &cubeMaterial, 8);
     api->process_event(c, fMid, d);
-    memcpy(&box.mid, d + off(fMid, "ReturnValue"), 8);
+    uintptr_t mid = 0;
+    memcpy(&mid, d + off(fMid, "ReturnValue"), 8);
+    box.mid = refOf(mid);
     return box;
 }
 
@@ -174,10 +178,10 @@ static void place(const Ref& c, double x, double y, double z) {
 }
 
 static void paint(const Box& b, unsigned rgb) {
-    if (!b.mid) return;
+    if (!usable(b.mid)) return;
     struct { uint64_t name; float rgba[4]; } color = {colorName, {0, 0, 0, 1}};
     for (int i = 0; i < 3; i++) color.rgba[i] = powf(((rgb >> (16 - 8 * i)) & 255) / 255.0f, 2.2f);  // the palette is sRGB
-    api->process_event(b.mid, fMidColor, &color);
+    api->process_event(b.mid.ptr, fMidColor, &color);
 }
 
 // A copy of the plate's mesh at these shares of its size, centred at x, y, z off the plate's middle.
@@ -240,8 +244,40 @@ static Ref makeLamp(uintptr_t actor, double y, double z) {
     return refOf(c);
 }
 
+// The plate's own mesh, in one colour, is the border. The game can put the mesh's material back
+// whenever it likes, and then nothing references ours and it is collected: a freed material
+// painted through is a crash, so this checks every pass and takes the mesh back.
+static bool ownBorder(Plate& p) {
+    if (!alive(p.border.c)) return false;
+    uintptr_t c = p.border.c.ptr;
+    unsigned char g[0x20] = {0};
+    api->process_event(c, fGetMaterial, g);
+    uintptr_t on = 0;
+    memcpy(&on, g + off(fGetMaterial, "ReturnValue"), 8);
+    if (usable(p.border.mid) && on == p.border.mid.ptr) return false;
+    if (!usable(p.border.mid)) {
+        unsigned char d[0x30] = {0};
+        memcpy(d + off(fMid, "SourceMaterial"), &cubeMaterial, 8);
+        api->process_event(c, fMid, d);
+        uintptr_t mid = 0;
+        memcpy(&mid, d + off(fMid, "ReturnValue"), 8);
+        p.border.mid = refOf(mid);
+        if (!mid) return false;
+    }
+    struct { int ret; } slots = {0};
+    api->process_event(c, fNumMaterials, &slots);
+    for (int i = 0; i < slots.ret; i++) {
+        unsigned char q[0x20] = {0};
+        memcpy(q + off(fSetMaterial, "ElementIndex"), &i, 4);
+        memcpy(q + off(fSetMaterial, "Material"), &p.border.mid.ptr, 8);
+        api->process_event(c, fSetMaterial, q);
+    }
+    return true;
+}
+
 static void dress(Plate& p) {
-    if (!cubeMaterial) cubeMaterial = loadAsset(L"/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial");
+    // Asked for each plate: with no plate fitted nothing holds it, and a kept pointer would go stale.
+    cubeMaterial = loadAsset(L"/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial");
     struct { uintptr_t cls, ret; } own = {cMesh, 0};
     api->process_event(p.actor.ptr, fGetComp, &own);
     uintptr_t mesh = own.ret ? get<uintptr_t>(own.ret + oStaticMesh) : 0;
@@ -252,20 +288,7 @@ static void dress(Plate& p) {
     memcpy(low, b + off(fBounds, "Min"), sizeof low);
     memcpy(high, b + off(fBounds, "Max"), sizeof high);
     for (int i = 0; i < 3; i++) { p.middle[i] = (low[i] + high[i]) / 2; p.half[i] = (high[i] - low[i]) / 2; }
-    // The mesh itself, in one colour, is the border.
-    unsigned char d[0x30] = {0};
-    memcpy(d + off(fMid, "SourceMaterial"), &cubeMaterial, 8);
-    api->process_event(own.ret, fMid, d);
     p.border.c = refOf(own.ret);
-    memcpy(&p.border.mid, d + off(fMid, "ReturnValue"), 8);
-    struct { int ret; } slots = {0};
-    api->process_event(own.ret, fNumMaterials, &slots);
-    for (int i = 1; i < slots.ret; i++) {
-        unsigned char q[0x20] = {0};
-        memcpy(q + off(fSetMaterial, "ElementIndex"), &i, 4);
-        memcpy(q + off(fSetMaterial, "Material"), &p.border.mid, 8);
-        api->process_event(own.ret, fSetMaterial, q);
-    }
     p.blank = makeBox(p.actor.ptr, mesh);
     p.band[0] = makeBox(p.actor.ptr, mesh);
     p.band[1] = makeBox(p.actor.ptr, mesh);
@@ -299,6 +322,7 @@ static void light(Plate& p, const Look& k, uintptr_t car) {
 }
 
 static void wear(Plate& p, const Look& k) {
+    if (ownBorder(p)) p.shown.clear();  // a new material has no colour yet
     std::wstring seen;
     for (int i = 0; i < NROWS; i++) if (i != R_LAMP && i != R_LAMPCOLOR) seen += std::to_wstring(k.v[i]) + L",";
     if (seen == p.shown) return;
@@ -631,6 +655,7 @@ static DWORD WINAPI run(LPVOID) {
     fGetComp = api->find_object("Function", "GetComponentByClass", "Actor");
     fBounds = api->find_object("Function", "GetLocalBounds", "StaticMeshComponent");
     fSetMaterial = api->find_object("Function", "SetMaterial", "PrimitiveComponent");
+    fGetMaterial = api->find_object("Function", "GetMaterial", "PrimitiveComponent");
     fNumMaterials = api->find_object("Function", "GetNumMaterials", "PrimitiveComponent");
     cLamp = api->find_object("Class", "PointLightComponent", "/Script/Engine");
     fPower = either("SetIntensity", "LightComponent", "LocalLightComponent");
@@ -638,7 +663,7 @@ static DWORD WINAPI run(LPVOID) {
     fLampReach = either("SetAttenuationRadius", "LocalLightComponent", "PointLightComponent");
     fLampShadows = either("SetCastShadows", "LightComponentBase", "LightComponent");
     fLampUnits = either("SetIntensityUnits", "LocalLightComponent", "PointLightComponent");
-    uintptr_t need[] = {fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits, cActor, cWords, cMesh, cVeh, fAdd, fFinish, fParent, fMobility, fRelLoc, fRelScale, fShow, fCollision, fShadow, fMid, fSetMesh,
+    uintptr_t need[] = {fGetMaterial, fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits, cActor, cWords, cMesh, cVeh, fAdd, fFinish, fParent, fMobility, fRelLoc, fRelScale, fShow, fCollision, fShadow, fMid, fSetMesh,
                         fMidColor, fToText, textCDO, fWords, fWorldSize, fInk, fAlignX, fAlignY, fTall, fToName, stringCDO, systemCDO, fPath, fRef, fLoad};
     for (uintptr_t f : need)
         if (!f) { MT_LOG("FAILED: engine functions not found -- plates stay plain"); return 0; }
