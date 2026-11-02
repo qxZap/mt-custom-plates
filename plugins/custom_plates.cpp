@@ -2,9 +2,12 @@
 //
 // The plate itself is a normal attachment (Attachment_SR_Number_Plate_01..08 in More Attachments),
 // so it is placed, moved and removed with the game's own attachment tools. Those meshes are
-// finished plates with their own artwork, so this builds a new face over each one out of boxes: a
-// border, a blank inside it and an optional band. Text sits on both faces, because the meshes are
-// thin along Y and text only reads from its front. Bold is the same text four times, a hair apart:
+// finished plates with their own artwork, so the plate gets a new face made of itself: the mesh
+// painted in one colour is the border, and a copy of the mesh a little smaller is the blank, which
+// keeps the rounded corners. The band is a third copy squeezed flat, one per face, because a
+// single band would read left from one side and right from the other. Text sits on both faces,
+// because the meshes are thin along Y and text only reads from its front. Bold is the same text
+// four times, a hair apart:
 // the engine font has no bold cut, and the game cooks no other font this can use.
 //
 // Tuning > License Plate, per vehicle: a template, nine characters, colours, band, text size,
@@ -38,10 +41,11 @@ static const struct { const wchar_t* name; unsigned rgb; } PALETTE[] = {
     {L"Navy", 0x10203F}, {L"Gold", 0xC9A227}, {L"Pink", 0xFF4FA3}, {L"Purple", 0x5B2A86}};
 static const int COLORS = 11;  // highest index
 
-enum { R_TEMPLATE, R_CHAR, R_INK = R_CHAR + 9, R_PLATE, R_BORDER, R_BAND, R_WHERE, R_SIZE, R_TALL, R_ACROSS, R_UP, NROWS };
-enum { KIND_TEMPLATE, KIND_LETTER, KIND_COLOR, KIND_OPTIONAL, KIND_WHERE, KIND_NUMBER };
+enum { R_TEMPLATE, R_CHAR, R_INK = R_CHAR + 9, R_PLATE, R_BORDER, R_BAND, R_WHERE, R_LAMP, R_LAMPCOLOR, R_SIZE, R_TALL, R_ACROSS, R_UP, NROWS };
+enum { KIND_TEMPLATE, KIND_LETTER, KIND_COLOR, KIND_OPTIONAL, KIND_WHERE, KIND_LAMP, KIND_NUMBER };
 
 static const wchar_t* const WHERE[] = {L"Left", L"Top", L"Bottom"};
+static const wchar_t* const LAMP[] = {L"Off", L"Engine on", L"Always"};
 // Border and band count 0 as None, 1.. as the palette.
 static const struct { const wchar_t* name; int ink, plate, border, band, where; } TEMPLATES[] = {
     {L"European", 1, 0, 2, 5, 0}, {L"UK Rear", 1, 2, 0, 0, 0}, {L"American", 4, 0, 5, 4, 1}, {L"Sunshine", 8, 2, 9, 7, 2},
@@ -56,6 +60,7 @@ static const struct { const wchar_t* label; const wchar_t* key; int top, kind; d
     {L"Text colour", L"Ink", COLORS, KIND_COLOR}, {L"Plate colour", L"Plate", COLORS, KIND_COLOR},
     {L"Border colour", L"Border", COLORS + 1, KIND_OPTIONAL}, {L"Band colour", L"Band", COLORS + 1, KIND_OPTIONAL},
     {L"Band position", L"BandAt", 2, KIND_WHERE},
+    {L"Plate light", L"Lamp", 2, KIND_LAMP}, {L"Light colour", L"LampColour", COLORS, KIND_COLOR},
     {L"Text size", L"Size", 70, KIND_NUMBER, 3, 0.1}, {L"Text height", L"Tall", 100, KIND_NUMBER, 1, 0.02},
     {L"Text across", L"Across", 160, KIND_NUMBER, -8, 0.1}, {L"Text up", L"Up", 80, KIND_NUMBER, -4, 0.1}};
 
@@ -94,14 +99,18 @@ static void saveLook(int64_t id, const Look& k) {
 // ---- the plate ----
 static uintptr_t cActor, cWords, cMesh, cVeh, fAdd, fFinish, fMobility, fCollision, fShadow, fSetMesh, fMid, fMidColor;
 static uintptr_t fToText, textCDO, fWords, fWorldSize, fInk, fAlignX, fAlignY, fTall, fRelLoc, fRelScale, fShow, fParent;
-static uintptr_t fToName, stringCDO, fPath, fRef, fLoad, systemCDO, cube, cubeMaterial;
+static uintptr_t fToName, stringCDO, fPath, fRef, fLoad, systemCDO, cubeMaterial;
+static uintptr_t fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits;
+static int oStaticMesh = -1, oEngine = -1, oHot = -1, oRpm = -1;
 static uint64_t colorName;
 static int oId = -1, oRelLoc;
 static int pTextIn, pTextRet;
-static const double FACE = 1.3;  // cm off the plate's centre, clear of the band
+// The eight meshes run from 29 x 13 to 46 x 14 cm, 1.8 to 2.6 thick, so everything is measured off
+// the one fitted: GetLocalBounds, not numbers from one plate. All of them are centred on the actor.
+static const double BORDER = 0.75, BAND_WIDE = 3, BAND_HIGH = 2.4, PROUD = 0.06, REFERENCE_HALF_HEIGHT = 6.56;  // cm
 
 struct Box { Ref c; uintptr_t mid; };
-struct Plate { Ref actor; Box border, blank, band; Ref text[2][4]; std::wstring shown; };
+struct Plate { Ref actor; Box border, blank, band[2]; Ref text[2][4], lamp[2]; std::wstring shown; double middle[3], half[3]; int lit; };
 static std::map<uintptr_t, Plate> plates;
 static std::vector<Ref> waiting, screens;
 static std::mutex lock;
@@ -124,7 +133,7 @@ static uintptr_t loadAsset(const wchar_t* path) {
 
 static Ref refOf(uintptr_t o) { return {o ? get<int>(o + L().obj_index) : 0, o}; }
 
-static Box makeBox(uintptr_t actor) {
+static Box makeBox(uintptr_t actor, uintptr_t mesh) {
     Box box = {};
     alignas(16) unsigned char p[0x100] = {0};
     int at = off(fAdd, "RelativeTransform");
@@ -142,7 +151,7 @@ static Box makeBox(uintptr_t actor) {
     api->process_event(c, fCollision, &none);
     api->process_event(c, fShadow, &none);
     unsigned char m[0x10] = {0};
-    memcpy(m, &cube, 8);
+    memcpy(m, &mesh, 8);
     api->process_event(c, fSetMesh, m);
     alignas(16) unsigned char f[0x100] = {0};
     memcpy(f + off(fFinish, "Component"), &c, 8);
@@ -171,11 +180,12 @@ static void paint(const Box& b, unsigned rgb) {
     api->process_event(b.mid, fMidColor, &color);
 }
 
-static void shape(const Box& b, double x, double z, double sx, double sy, double sz) {
+// A copy of the plate's mesh at these shares of its size, centred at x, y, z off the plate's middle.
+static void shape(const Plate& p, const Box& b, double x, double y, double z, double sx, double sy, double sz) {
     if (!alive(b.c)) return;
     double size[3] = {sx, sy, sz};
     api->process_event(b.c.ptr, fRelScale, size);
-    place(b.c, x, 0, z);
+    place(b.c, x - p.middle[0] * sx, y - p.middle[1] * sy, z - p.middle[2] * sz);
 }
 
 static void show(const Ref& c, bool on) {
@@ -202,43 +212,117 @@ static Ref makeWords(uintptr_t actor, double yaw) {
     return refOf(c);
 }
 
-static void dress(Plate& p) {
-    if (!cube) {
-        cube = loadAsset(L"/Engine/BasicShapes/Cube.Cube");
-        cubeMaterial = loadAsset(L"/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial");
-        MT_LOG("cube %d, material %d", cube != 0, cubeMaterial != 0);
-    }
-    if (!cube) return;
-    p.border = makeBox(p.actor.ptr);
-    p.blank = makeBox(p.actor.ptr);
-    p.band = makeBox(p.actor.ptr);
-    for (int side = 0; side < 2; side++)
-        for (int i = 0; i < 4; i++) p.text[side][i] = makeWords(p.actor.ptr, side ? -90 : 90);
+static Ref makeLamp(uintptr_t actor, double y, double z) {
+    alignas(16) unsigned char p[0x100] = {0};
+    int at = off(fAdd, "RelativeTransform");
+    double spin[4] = {0, 0, 0, 1}, where[3] = {0, y, z}, scale[3] = {1, 1, 1};
+    memcpy(p + off(fAdd, "Class"), &cLamp, 8);
+    memcpy(p + at, spin, sizeof spin);
+    memcpy(p + at + 0x20, where, sizeof where);
+    memcpy(p + at + 0x40, scale, sizeof scale);
+    p[off(fAdd, "bDeferredFinish")] = 1;
+    api->process_event(actor, fAdd, p);
+    uintptr_t c = 0;
+    memcpy(&c, p + off(fAdd, "ReturnValue"), 8);
+    if (!c) return {};
+    uint8_t movable = 2, lumens = 2;
+    unsigned char shadows[8] = {0};
+    float reach = 45, power = 25;
+    api->process_event(c, fMobility, &movable);
+    api->process_event(c, fLampShadows, shadows);
+    api->process_event(c, fLampUnits, &lumens);
+    api->process_event(c, fLampReach, &reach);
+    api->process_event(c, fPower, &power);
+    alignas(16) unsigned char f[0x100] = {0};
+    memcpy(f + off(fFinish, "Component"), &c, 8);
+    memcpy(f + off(fFinish, "RelativeTransform"), p + at, 0x60);
+    api->process_event(actor, fFinish, f);
+    return refOf(c);
 }
 
-static int64_t idOf(uintptr_t actor) {
+static void dress(Plate& p) {
+    if (!cubeMaterial) cubeMaterial = loadAsset(L"/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial");
+    struct { uintptr_t cls, ret; } own = {cMesh, 0};
+    api->process_event(p.actor.ptr, fGetComp, &own);
+    uintptr_t mesh = own.ret ? get<uintptr_t>(own.ret + oStaticMesh) : 0;
+    if (!mesh || !cubeMaterial) { MT_LOG("no mesh or material on the plate -- left plain"); return; }
+    double low[3], high[3];
+    unsigned char b[0x60] = {0};
+    api->process_event(own.ret, fBounds, b);
+    memcpy(low, b + off(fBounds, "Min"), sizeof low);
+    memcpy(high, b + off(fBounds, "Max"), sizeof high);
+    for (int i = 0; i < 3; i++) { p.middle[i] = (low[i] + high[i]) / 2; p.half[i] = (high[i] - low[i]) / 2; }
+    // The mesh itself, in one colour, is the border.
+    unsigned char d[0x30] = {0};
+    memcpy(d + off(fMid, "SourceMaterial"), &cubeMaterial, 8);
+    api->process_event(own.ret, fMid, d);
+    p.border.c = refOf(own.ret);
+    memcpy(&p.border.mid, d + off(fMid, "ReturnValue"), 8);
+    struct { int ret; } slots = {0};
+    api->process_event(own.ret, fNumMaterials, &slots);
+    for (int i = 1; i < slots.ret; i++) {
+        unsigned char q[0x20] = {0};
+        memcpy(q + off(fSetMaterial, "ElementIndex"), &i, 4);
+        memcpy(q + off(fSetMaterial, "Material"), &p.border.mid, 8);
+        api->process_event(own.ret, fSetMaterial, q);
+    }
+    p.blank = makeBox(p.actor.ptr, mesh);
+    p.band[0] = makeBox(p.actor.ptr, mesh);
+    p.band[1] = makeBox(p.actor.ptr, mesh);
+    for (int side = 0; side < 2; side++) {
+        for (int i = 0; i < 4; i++) p.text[side][i] = makeWords(p.actor.ptr, side ? -90 : 90);
+        p.lamp[side] = makeLamp(p.actor.ptr, (side ? -1 : 1) * (p.half[1] + 2.5), p.half[2] + 1.5);
+        show(p.lamp[side], false);
+    }
+    p.lit = -1;
+}
+
+static uintptr_t carOf(uintptr_t actor) {
     struct { uintptr_t ret; } parent = {0};
     api->process_event(actor, fParent, &parent);
-    if (!parent.ret || !api->is_a(classOf(parent.ret), cVeh) || oId < 0) return 0;
-    return get<long long>(parent.ret + oId);
+    return parent.ret && api->is_a(classOf(parent.ret), cVeh) ? parent.ret : 0;
+}
+
+static void light(Plate& p, const Look& k, uintptr_t car) {
+    uintptr_t engine = car && oEngine >= 0 ? get<uintptr_t>(car + oEngine) : 0;
+    bool running = engine && oHot >= 0 && get<float>(engine + oHot + oRpm) > 0;
+    int want = k.v[R_LAMP] == 2 || (k.v[R_LAMP] == 1 && running) ? 1 + k.v[R_LAMPCOLOR] : 0;
+    if (want == p.lit) return;
+    p.lit = want;
+    for (const Ref& c : p.lamp) {
+        show(c, want != 0);
+        if (!want || !alive(c)) continue;
+        unsigned rgb = PALETTE[want - 1].rgb;
+        struct { float rgba[4]; bool srgb; } tint = {{((rgb >> 16) & 255) / 255.0f, ((rgb >> 8) & 255) / 255.0f, (rgb & 255) / 255.0f, 1}, true};
+        api->process_event(c.ptr, fLampColor, &tint);
+    }
 }
 
 static void wear(Plate& p, const Look& k) {
     std::wstring seen;
-    for (int v : k.v) seen += std::to_wstring(v) + L",";
+    for (int i = 0; i < NROWS; i++) if (i != R_LAMP && i != R_LAMPCOLOR) seen += std::to_wstring(k.v[i]) + L",";
     if (seen == p.shown) return;
     p.shown = seen;
     int border = k.v[R_BORDER], band = k.v[R_BAND];
     unsigned back = PALETTE[k.v[R_PLATE]].rgb;
     paint(p.border, border ? PALETTE[border - 1].rgb : back);
     paint(p.blank, back);
-    shape(p.border, 0, 0, 0.3, 0.02, 0.137);
-    shape(p.blank, 0, 0, 0.285, 0.022, 0.122);
-    show(p.band.c, band != 0);
-    if (band) {
-        paint(p.band, PALETTE[band - 1].rgb);
-        if (k.v[R_WHERE] == 0) shape(p.band, -12.7, 0, 0.03, 0.024, 0.122);
-        else shape(p.band, 0, k.v[R_WHERE] == 1 ? 5 : -5, 0.285, 0.024, 0.022);
+    double hx = p.half[0], hy = p.half[1], hz = p.half[2];
+    if (hx <= 0 || hz <= 0) return;  // not dressed
+    // The same border all round: a share of each side would be thick on the long plates.
+    double wide = 1 - BORDER / hx, high = 1 - BORDER / hz;
+    shape(p, p.blank, 0, 0, 0, wide, 1.1, high);
+    double top = hy * 1.1;  // the blank's face
+    for (int side = 0; side < 2; side++) {
+        const Box& b = p.band[side];
+        show(b.c, band != 0);
+        if (!band) continue;
+        paint(b, PALETTE[band - 1].rgb);
+        double y = (side ? -1 : 1) * (top + PROUD - hy * 0.3);
+        // Flush with the blank's own edge. Left is -X from the +Y face and +X from the other.
+        double x = hx - BORDER - BAND_WIDE / 2, z = hz - BORDER - BAND_HIGH / 2;
+        if (k.v[R_WHERE] == 0) shape(p, b, side ? x : -x, y, 0, BAND_WIDE / 2 / hx, 0.3, high);
+        else shape(p, b, 0, y, k.v[R_WHERE] == 1 ? z : -z, wide, 0.3, BAND_HIGH / 2 / hz);
     }
     std::wstring words;
     for (int i = 0; i < 9; i++) words += ALPHABET[k.v[R_CHAR + i]];
@@ -248,7 +332,8 @@ static void wear(Plate& p, const Look& k) {
     memcpy(t + pTextIn, &s, sizeof s);
     api->process_event(textCDO, fToText, t);
     static const double NUDGE[4][2] = {{-0.05, -0.05}, {0.05, -0.05}, {-0.05, 0.05}, {0.05, 0.05}};
-    float size = (float)number(k, R_SIZE), tall = (float)number(k, R_TALL);
+    float size = (float)(number(k, R_SIZE) * hz / REFERENCE_HALF_HEIGHT), tall = (float)number(k, R_TALL);
+    double face = top + PROUD + 0.1;
     unsigned ink = PALETTE[k.v[R_INK]].rgb;
     struct { uint8_t b, g, r, a; } color = {(uint8_t)ink, (uint8_t)(ink >> 8), (uint8_t)(ink >> 16), 255};
     double across = number(k, R_ACROSS), up = number(k, R_UP);
@@ -262,7 +347,7 @@ static void wear(Plate& p, const Look& k) {
             api->process_event(c.ptr, fWorldSize, &size);
             api->process_event(c.ptr, fTall, &tall);
             api->process_event(c.ptr, fInk, &color);
-            place(c, (side ? -across : across) + NUDGE[i][0], side ? -FACE : FACE, up + NUDGE[i][1]);
+            place(c, (side ? -across : across) + NUDGE[i][0], side ? -face : face, up + NUDGE[i][1]);
         }
 }
 
@@ -344,6 +429,7 @@ static void showRow(int i, const Look& k) {
         case KIND_COLOR: swprintf_s(text, L"%s", PALETTE[v].name); break;
         case KIND_OPTIONAL: swprintf_s(text, L"%s", v ? PALETTE[v - 1].name : L"None"); break;
         case KIND_WHERE: swprintf_s(text, L"%s", WHERE[v]); break;
+        case KIND_LAMP: swprintf_s(text, L"%s", LAMP[v]); break;
         default: swprintf_s(text, L"%.1f", number(k, i));
     }
     setText(panel.rows[i].value, text);
@@ -482,7 +568,10 @@ static void tick(void*) {
     wearAt = now + 100;
     for (auto it = plates.begin(); it != plates.end();) {
         if (!alive(it->second.actor)) { it = plates.erase(it); continue; }
-        wear(it->second, lookOf(idOf(it->first)));
+        uintptr_t car = carOf(it->first);
+        const Look& k = lookOf(car && oId >= 0 ? get<long long>(car + oId) : 0);
+        wear(it->second, k);
+        light(it->second, k, car);
         ++it;
     }
 }
@@ -535,12 +624,31 @@ static DWORD WINAPI run(LPVOID) {
     fPath = api->find_object("Function", "MakeSoftObjectPath", "KismetSystemLibrary");
     fRef = api->find_object("Function", "Conv_SoftObjPathToSoftObjRef", "KismetSystemLibrary");
     fLoad = api->find_object("Function", "LoadAsset_Blocking", "KismetSystemLibrary");
-    uintptr_t need[] = {cActor, cWords, cMesh, cVeh, fAdd, fFinish, fParent, fMobility, fRelLoc, fRelScale, fShow, fCollision, fShadow, fMid, fSetMesh,
+    auto either = [](const char* name, const char* a, const char* b) {
+        uintptr_t f = api->find_object("Function", name, a);
+        return f ? f : api->find_object("Function", name, b);
+    };
+    fGetComp = api->find_object("Function", "GetComponentByClass", "Actor");
+    fBounds = api->find_object("Function", "GetLocalBounds", "StaticMeshComponent");
+    fSetMaterial = api->find_object("Function", "SetMaterial", "PrimitiveComponent");
+    fNumMaterials = api->find_object("Function", "GetNumMaterials", "PrimitiveComponent");
+    cLamp = api->find_object("Class", "PointLightComponent", "/Script/Engine");
+    fPower = either("SetIntensity", "LightComponent", "LocalLightComponent");
+    fLampColor = either("SetLightColor", "LightComponent", "LightComponentBase");
+    fLampReach = either("SetAttenuationRadius", "LocalLightComponent", "PointLightComponent");
+    fLampShadows = either("SetCastShadows", "LightComponentBase", "LightComponent");
+    fLampUnits = either("SetIntensityUnits", "LocalLightComponent", "PointLightComponent");
+    uintptr_t need[] = {fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits, cActor, cWords, cMesh, cVeh, fAdd, fFinish, fParent, fMobility, fRelLoc, fRelScale, fShow, fCollision, fShadow, fMid, fSetMesh,
                         fMidColor, fToText, textCDO, fWords, fWorldSize, fInk, fAlignX, fAlignY, fTall, fToName, stringCDO, systemCDO, fPath, fRef, fLoad};
     for (uintptr_t f : need)
         if (!f) { MT_LOG("FAILED: engine functions not found -- plates stay plain"); return 0; }
     oId = off(cVeh, "Net_VehicleId");
     oRelLoc = off(fRelLoc, "NewLocation");
+    oStaticMesh = off(cMesh, "StaticMesh");
+    oEngine = off(cVeh, "EngineComponent");
+    uintptr_t cEngine = api->find_object("Class", "MTEngineComponent", "/Script/MotorTown");
+    uintptr_t sHot = api->find_object("ScriptStruct", "MTEngineHotState", "/Script/MotorTown");
+    if (cEngine && sHot) { oHot = off(cEngine, "NetLC_EngineHotState"); oRpm = off(sHot, "CurrentRPM"); }
     pTextIn = off(fToText, "InString"); pTextRet = off(fToText, "ReturnValue");
 
     uintptr_t cScreen = api->find_object("Class", "GarageTuningWidget", "/Script/MotorTown");
