@@ -13,7 +13,11 @@
 // Tuning > License Plate, per vehicle: a template, nine characters, colours, band, text size,
 // height and position. Settings: Binaries\Win64\plugins\custom_plates.ini, [Vehicle<id>].
 //
-// shortcut: other players see the plain plate. Their game has no way to learn the design yet.
+// The design travels on the car. The game sends every vehicle's Net_Tunings to every player and
+// saves them, and ServerSetTuning takes any target, so each field of the design is a wheel width
+// tuning on a target no axle has (7000 up). Its value stays inside the game's 0.80 - 1.20 so a
+// vanilla server keeps it: 39 steps, skipping 1.00, which the game drops as the default.
+// Players with this plugin read the plate off the car; to anyone else those entries are nothing.
 
 #include <cmath>
 #include <map>
@@ -100,7 +104,9 @@ static void saveLook(int64_t id, const Look& k) {
 static uintptr_t cActor, cWords, cMesh, cVeh, fAdd, fFinish, fMobility, fCollision, fShadow, fSetMesh, fMid, fMidColor;
 static uintptr_t fToText, textCDO, fWords, fWorldSize, fInk, fAlignX, fAlignY, fTall, fRelLoc, fRelScale, fShow, fParent;
 static uintptr_t fToName, stringCDO, fPath, fRef, fLoad, systemCDO, cubeMaterial;
-static uintptr_t fGetMaterial, fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits;
+static uintptr_t fSetTuning, fGetPC, fGetPawn, gameplayCDO, fGetMaterial, fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits;
+static int oTunings = -1, tParam, tTarget, tValue, tSize, pSetVehicle, pSetParam, pSetTarget, pSetValue;
+static uintptr_t editing;  // the car on the plate rows: its design is still being sent
 static int oStaticMesh = -1, oEngine = -1, oHot = -1, oRpm = -1;
 static uint64_t colorName;
 static int oId = -1, oRelLoc;
@@ -375,6 +381,74 @@ static void wear(Plate& p, const Look& k) {
         }
 }
 
+// ---- the design on the car ----
+static const int WIDTH_PARAM = 1, FIRST_TARGET = 7000, SENDS_PER_PASS = 6;
+
+static float valueOf(int digit) { return (digit < 20 ? 80 + digit : 81 + digit) / 100.0f; }
+static int digitOf(float value) {
+    int n = (int)floor((value - 0.8f) * 100 + 0.5f);
+    return n < 0 || n > 39 || n == 20 ? -1 : n < 20 ? n : n - 1;
+}
+
+static bool net(uintptr_t car, int target, int& digit) {
+    uintptr_t d = get<uintptr_t>(car + oTunings);
+    int n = get<int>(car + oTunings + 8);
+    for (int i = 0; d && i < n && i < 256; i++) {
+        uintptr_t e = d + (uintptr_t)i * tSize;
+        if (get<uint8_t>(e + tParam) != WIDTH_PARAM || get<int>(e + tTarget) != target) continue;
+        digit = digitOf(get<float>(e + tValue));
+        return digit >= 0;
+    }
+    return false;
+}
+
+// Rows from R_CHAR on, one digit each, or two for the rows with more steps than a digit holds.
+template <class Each> static void fields(Each each) {
+    int target = FIRST_TARGET;
+    for (int r = R_CHAR; r < NROWS; r++) {
+        each(r, target, ROWS[r].top < 39 ? 1 : 2);
+        target += ROWS[r].top < 39 ? 1 : 2;
+    }
+}
+
+static bool readCar(uintptr_t car, Look& out) {
+    if (oTunings < 0) return false;
+    bool whole = true;
+    out = base;
+    fields([&](int r, int target, int digits) {
+        int a = 0, b = 0;
+        whole = whole && net(car, target, a) && (digits == 1 || net(car, target + 1, b));
+        int v = digits == 1 ? a : a * 39 + b;
+        if (whole && v <= ROWS[r].top) out.v[r] = v;
+        else whole = false;
+    });
+    return whole;
+}
+
+static void sendCar(uintptr_t car, const Look& k) {
+    struct { uintptr_t context; int index; uintptr_t ret; } pc = {car, 0, 0};
+    api->process_event(gameplayCDO, fGetPC, &pc);
+    if (!pc.ret) return;
+    int left = SENDS_PER_PASS;
+    auto send = [&](int target, int digit) {
+        int have = -1;
+        if (left <= 0 || (net(car, target, have) && have == digit)) return;
+        left--;
+        unsigned char q[0x20] = {0};
+        float value = valueOf(digit);
+        memcpy(q + pSetVehicle, &car, 8);
+        q[pSetParam] = WIDTH_PARAM;
+        memcpy(q + pSetTarget, &target, 4);
+        memcpy(q + pSetValue, &value, 4);
+        api->process_event(pc.ret, fSetTuning, q);
+    };
+    fields([&](int r, int target, int digits) {
+        int v = k.v[r];
+        if (digits == 1) send(target, v);
+        else { send(target, v / 39); send(target + 1, v % 39); }
+    });
+}
+
 // ---- the Tuning screen: the same rows ECU Tuning uses ----
 struct Row { uintptr_t widget, spin, value; };
 struct Panel {
@@ -502,6 +576,7 @@ static void tickPanel(DWORD now) {
     }
     if (!screen) {
         if (panel.open && alive(panel.screen)) closeRows();
+        editing = 0;
         return;
     }
     uintptr_t vehicle = get<uintptr_t>(screen + oVehicle);
@@ -513,6 +588,7 @@ static void tickPanel(DWORD now) {
         panel.screen = refOf(screen);
     }
     Look& k = lookOf(id);
+    if (panel.open) editing = vehicle;
     if (panel.open) {
         if (childIndex(box, panel.rows[0].widget) < 0) {  // the game rebuilt the list and our rows with it
             panel.open = false; panel.button = 0; panel.hidden.clear();
@@ -587,13 +663,30 @@ static void tick(void*) {
     waiting.clear();
     DWORD now = GetTickCount();
     if (spinRange || !screens.empty()) tickPanel(now);
-    static DWORD wearAt;
+    static DWORD wearAt, sendAt;
     if ((int)(now - wearAt) < 0) return;
     wearAt = now + 100;
+    uintptr_t mine = editing;
+    if (!mine) {
+        for (auto& entry : plates) {
+            uintptr_t car = alive(entry.second.actor) ? carOf(entry.first) : 0;
+            if (!car) continue;
+            struct { uintptr_t context; int index; uintptr_t ret; } who = {car, 0, 0};
+            api->process_event(gameplayCDO, fGetPawn, &who);
+            if (who.ret == car) { mine = car; break; }
+        }
+    }
+    if (mine && oTunings >= 0 && oId >= 0 && get<long long>(mine + oId) > 0 && (int)(now - sendAt) >= 0) {
+        sendAt = now + 300;
+        sendCar(mine, lookOf(get<long long>(mine + oId)));
+    }
     for (auto it = plates.begin(); it != plates.end();) {
         if (!alive(it->second.actor)) { it = plates.erase(it); continue; }
         uintptr_t car = carOf(it->first);
-        const Look& k = lookOf(car && oId >= 0 ? get<long long>(car + oId) : 0);
+        int64_t id = car && oId >= 0 ? get<long long>(car + oId) : 0;
+        Look carried;
+        // The plate on the rows is mid-send. Any other car shows what it carries, or else a saved look.
+        const Look& k = car && car != mine && readCar(car, carried) ? carried : lookOf(id);
         wear(it->second, k);
         light(it->second, k, car);
         ++it;
@@ -669,6 +762,19 @@ static DWORD WINAPI run(LPVOID) {
         if (!f) { MT_LOG("FAILED: engine functions not found -- plates stay plain"); return 0; }
     oId = off(cVeh, "Net_VehicleId");
     oRelLoc = off(fRelLoc, "NewLocation");
+    uintptr_t cPC = api->find_object("Class", "MotorTownPlayerController", "/Script/MotorTown");
+    uintptr_t sEntry = api->find_object("ScriptStruct", "MTTuningEntry", "/Script/MotorTown");
+    gameplayCDO = api->find_object("GameplayStatics", "Default__GameplayStatics", "/Script/Engine");
+    fGetPC = api->find_object("Function", "GetPlayerController", "GameplayStatics");
+    fGetPawn = api->find_object("Function", "GetPlayerPawn", "GameplayStatics");
+    fSetTuning = api->find_object("Function", "ServerSetTuning", "MotorTownPlayerController");
+    oTunings = off(cVeh, "Net_Tunings");
+    if (sEntry) { tParam = off(sEntry, "Param"); tTarget = off(sEntry, "TargetId"); tValue = off(sEntry, "Value"); tSize = get<int>(sEntry + L().struct_child_props + 8); }
+    if (fSetTuning) { pSetVehicle = off(fSetTuning, "Vehicle"); pSetParam = off(fSetTuning, "Param"); pSetTarget = off(fSetTuning, "TargetId"); pSetValue = off(fSetTuning, "Value"); }
+    if (!cPC || !sEntry || !gameplayCDO || !fGetPC || !fGetPawn || !fSetTuning || oTunings < 0 || tSize <= 0 || pSetValue < 0) {
+        MT_LOG("tuning calls not found -- plates stay on this machine");
+        oTunings = -1;
+    }
     oStaticMesh = off(cMesh, "StaticMesh");
     oEngine = off(cVeh, "EngineComponent");
     uintptr_t cEngine = api->find_object("Class", "MTEngineComponent", "/Script/MotorTown");
