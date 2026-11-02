@@ -13,11 +13,10 @@
 // Tuning > License Plate, per vehicle: a template, nine characters, colours, band, text size,
 // height and position. Settings: Binaries\Win64\plugins\custom_plates.ini, [Vehicle<id>].
 //
-// The design travels on the plate. The game sends every vehicle's Net_Parts to every player and
-// saves it, and ServerSetPartFloatValue writes into a part's FloatValues, so the design is a few
-// numbers on the plate part itself. A float holds whole numbers exactly up to 16.7 million, so
-// each one packs several fields. Players with this plugin read it off the car; to anyone else
-// those values are nothing. Every plate on a car wears the design stored on the first one.
+// The design travels on the car. A vehicle's Customization is a list of (material slot, colour)
+// the game sends to every player and saves. Entries with slot names no material has paint
+// nothing, and a colour's three bytes hold one packed number, so five entries carry a plate.
+// Players with this plugin read them off the car; to anyone else they are nothing.
 
 #include <cmath>
 #include <map>
@@ -104,8 +103,9 @@ static void saveLook(int64_t id, const Look& k) {
 static uintptr_t cActor, cWords, cMesh, cVeh, fAdd, fFinish, fMobility, fCollision, fShadow, fSetMesh, fMid, fMidColor;
 static uintptr_t fToText, textCDO, fWords, fWorldSize, fInk, fAlignX, fAlignY, fTall, fRelLoc, fRelScale, fShow, fParent;
 static uintptr_t fToName, stringCDO, fPath, fRef, fLoad, systemCDO, cubeMaterial;
-static uintptr_t fSetValue, fGetPawn, gameplayCDO, fGetMaterial, fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits;
-static int oParts = -1, oPartKey, oPartSlot, oPartFloats, partSize, pSetSlot, pSetIndex, pSetValue;
+static uintptr_t fGetPawn, gameplayCDO, fGetMaterial, fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits;
+static uintptr_t fGetPC, fSendCustom;
+static int oCustom = -1, cColors, cSlot, cColor, cSize, customSize, pSendVehicle, pSendCustom;
 static uintptr_t editing;  // the car on the plate rows: its design is still being sent
 static int oStaticMesh = -1, oEngine = -1, oHot = -1, oRpm = -1;
 static uint64_t colorName;
@@ -382,10 +382,8 @@ static void wear(Plate& p, const Look& k) {
         }
 }
 
-// ---- the design on the plate ----
-// FloatValues past what the game itself uses on a part. The mark says these are ours.
-static const int FIRST_VALUE = 16, PACKED = 5, SENDS_PER_PASS = 6;
-static const float MARK = 7654321;
+// ---- the design on the car ----
+static const int PACKED = 5;
 
 static void pack(const Look& k, int out[PACKED]) {
     const int* v = k.v;
@@ -412,24 +410,36 @@ static void unpack(const int in[PACKED], Look& k) {
     v[R_ACROSS] = f % 161; v[R_UP] = f / 161;
 }
 
-static uintptr_t platePart(uintptr_t car) {
-    uintptr_t d = get<uintptr_t>(car + oParts);
-    int n = get<int>(car + oParts + 8);
-    for (int i = 0; d && i < n && i < 256; i++) {
-        uintptr_t part = d + (uintptr_t)i * partSize;
-        if (fname(part + oPartKey).find("Number_Plate") != std::string::npos) return part;
-    }
-    return 0;
+static uint64_t carrier[PACKED];  // QXP0 .. QXP4
+
+static uint64_t nameOf(const wchar_t* text) {
+    unsigned char n[0x40] = {0};
+    FStr t = str(text);
+    memcpy(n + off(fToName, "InString"), &t, sizeof t);
+    api->process_event(stringCDO, fToName, n);
+    uint64_t out = 0;
+    memcpy(&out, n + off(fToName, "ReturnValue"), 8);
+    return out;
+}
+
+static int carried(uint64_t name) {
+    for (int i = 0; i < PACKED; i++)
+        if (carrier[i] == name) return i;
+    return -1;
 }
 
 static bool readCar(uintptr_t car, Look& out) {
-    uintptr_t part = oParts >= 0 ? platePart(car) : 0;
-    if (!part) return false;
-    uintptr_t data = get<uintptr_t>(part + oPartFloats);
-    int n = get<int>(part + oPartFloats + 8);
-    if (!data || n < FIRST_VALUE + 1 + PACKED || get<float>(data + FIRST_VALUE * 4) != MARK) return false;
-    int in[PACKED];
-    for (int i = 0; i < PACKED; i++) in[i] = (int)get<float>(data + (uintptr_t)(FIRST_VALUE + 1 + i) * 4);
+    if (oCustom < 0) return false;
+    uintptr_t d = get<uintptr_t>(car + oCustom + cColors);
+    int n = get<int>(car + oCustom + cColors + 8), in[PACKED], got = 0;
+    for (int i = 0; d && i < n && i < 64; i++) {
+        uintptr_t e = d + (uintptr_t)i * cSize;
+        int at = carried(get<uint64_t>(e + cSlot));
+        if (at < 0) continue;
+        in[at] = get<int>(e + cColor) & 0xFFFFFF;
+        got |= 1 << at;
+    }
+    if (got != (1 << PACKED) - 1) return false;
     out = base;
     unpack(in, out);
     for (int i = R_CHAR; i < NROWS; i++)
@@ -437,27 +447,46 @@ static bool readCar(uintptr_t car, Look& out) {
     return true;
 }
 
+// The list goes back whole: the car's own colours, then ours. Sent only when ours differ.
 static void sendCar(uintptr_t car, const Look& k) {
-    uintptr_t part = platePart(car);
-    if (!part) return;
     int want[PACKED];
     pack(k, want);
-    uintptr_t data = get<uintptr_t>(part + oPartFloats);
-    int n = get<int>(part + oPartFloats + 8);
-    uint16_t slot = get<uint16_t>(part + oPartSlot);
-    for (int i = 0, left = SENDS_PER_PASS; i <= PACKED && left > 0; i++) {
-        int index = FIRST_VALUE + i;
-        float value = i ? (float)want[i - 1] : MARK;
-        if (data && index < n && get<float>(data + (uintptr_t)index * 4) == value) continue;
-        left--;
-        unsigned char q[0x20] = {0};
-        memcpy(q + pSetSlot, &slot, 2);
-        memcpy(q + pSetIndex, &index, 4);
-        memcpy(q + pSetValue, &value, 4);
-        api->process_event(car, fSetValue, q);
-        static int said;
-        if (said < 40) { said++; MT_LOG("sent slot %d index %d value %.0f, part had %d values", slot, index, value, n); }
+    uintptr_t d = get<uintptr_t>(car + oCustom + cColors);
+    int n = get<int>(car + oCustom + cColors + 8), have = 0;
+    static unsigned char list[0x40 * 72];
+    if (n > 64 || cSize > 0x40) return;
+    bool same = true;
+    int seen = 0;
+    for (int i = 0; d && i < n; i++) {
+        uintptr_t e = d + (uintptr_t)i * cSize;
+        int at = carried(get<uint64_t>(e + cSlot));
+        if (at >= 0) {
+            seen |= 1 << at;
+            same = same && (get<int>(e + cColor) & 0xFFFFFF) == want[at];
+            continue;
+        }
+        rd(e, list + (uintptr_t)have * cSize, cSize);
+        have++;
     }
+    if (same && seen == (1 << PACKED) - 1) return;
+    for (int i = 0; i < PACKED; i++) {
+        unsigned char* e = list + (uintptr_t)(have + i) * cSize;
+        memset(e, 0, cSize);
+        uint32_t color = (uint32_t)want[i] | 0xFF000000u;
+        memcpy(e + cSlot, &carrier[i], 8);
+        memcpy(e + cColor, &color, 4);
+    }
+    struct { uintptr_t context; int index; uintptr_t ret; } pc = {car, 0, 0};
+    api->process_event(gameplayCDO, fGetPC, &pc);
+    if (!pc.ret) return;
+    unsigned char q[0x40] = {0};
+    memcpy(q + pSendVehicle, &car, 8);
+    rd(car + oCustom, q + pSendCustom, customSize);  // BodyMaterialIndex stays as it is
+    struct { void* data; int num, max; } colors = {list, have + PACKED, have + PACKED};
+    memcpy(q + pSendCustom + cColors, &colors, sizeof colors);
+    api->process_event(pc.ret, fSendCustom, q);
+    static int said;
+    if (said < 30) { said++; MT_LOG("sent design: %d colours of its own, list was %d", have, n); }
 }
 
 // ---- the Tuning screen: the same rows ECU Tuning uses ----
@@ -657,6 +686,13 @@ static void tickPanel(DWORD now) {
 static void tick(void*) {
     InterlockedExchange(&queued, 0);
     std::lock_guard<std::mutex> g(lock);
+    if (!carrier[0]) {
+        for (int i = 0; i < PACKED; i++) {
+            wchar_t text[8];
+            swprintf_s(text, L"QXP%d", i);
+            carrier[i] = nameOf(text);
+        }
+    }
     if (!colorName) {
         unsigned char n[0x40] = {0};
         FStr name = str(L"Color");
@@ -692,17 +728,17 @@ static void tick(void*) {
         announced = mine;
         if (mine) MT_LOG("my plate car: %s #%lld", objName(classOf(mine)).c_str(), oId >= 0 ? get<long long>(mine + oId) : 0);
     }
-    if (mine && oParts >= 0 && oId >= 0 && get<long long>(mine + oId) > 0 && (int)(now - sendAt) >= 0) {
-        sendAt = now + 500;
+    if (mine && oCustom >= 0 && oId >= 0 && get<long long>(mine + oId) > 0 && (int)(now - sendAt) >= 0) {
+        sendAt = now + 1000;
         sendCar(mine, lookOf(get<long long>(mine + oId)));
     }
     for (auto it = plates.begin(); it != plates.end();) {
         if (!alive(it->second.actor)) { it = plates.erase(it); continue; }
         uintptr_t car = carOf(it->first);
         int64_t id = car && oId >= 0 ? get<long long>(car + oId) : 0;
-        Look carried;
+        Look worn;
         // The plate on the rows is mid-send. Any other car shows what it carries, or else a saved look.
-        const Look& k = car && car != mine && readCar(car, carried) ? carried : lookOf(id);
+        const Look& k = car && car != mine && readCar(car, worn) ? worn : lookOf(id);
         if (it->second.half[0] <= 0) dress(it->second);
         wear(it->second, k);
         light(it->second, k, car);
@@ -779,16 +815,22 @@ static DWORD WINAPI run(LPVOID) {
         if (!f) { MT_LOG("FAILED: engine functions not found -- plates stay plain"); return 0; }
     oId = off(cVeh, "Net_VehicleId");
     oRelLoc = off(fRelLoc, "NewLocation");
-    uintptr_t sPart = api->find_object("ScriptStruct", "MTVehiclePart", "/Script/MotorTown");
+    uintptr_t sCustom = api->find_object("ScriptStruct", "MTVehicleCustomization", "/Script/MotorTown");
+    uintptr_t sColor = api->find_object("ScriptStruct", "MTVehicleCustomizationColor", "/Script/MotorTown");
     gameplayCDO = api->find_object("GameplayStatics", "Default__GameplayStatics", "/Script/Engine");
     fGetPawn = api->find_object("Function", "GetPlayerPawn", "GameplayStatics");
-    fSetValue = api->find_object("Function", "ServerSetPartFloatValue", "MTVehicle");
-    oParts = off(cVeh, "Net_Parts");
-    if (sPart) { oPartKey = off(sPart, "Key"); oPartSlot = off(sPart, "Slot"); oPartFloats = off(sPart, "FloatValues"); partSize = get<int>(sPart + L().struct_child_props + 8); }
-    if (fSetValue) { pSetSlot = off(fSetValue, "PartSlot"); pSetIndex = off(fSetValue, "ValueIndex"); pSetValue = off(fSetValue, "Value"); }
-    if (!sPart || !gameplayCDO || !fGetPawn || !fSetValue || oParts < 0 || oPartFloats < 0 || partSize <= 0 || pSetValue < 0) {
-        MT_LOG("part calls not found -- plates stay on this machine");
-        oParts = -1;
+    fGetPC = api->find_object("Function", "GetPlayerController", "GameplayStatics");
+    fSendCustom = api->find_object("Function", "ServerSetVehicleCustomization", "MotorTownPlayerController");
+    oCustom = off(cVeh, "Customization");
+    if (sCustom && sColor) {
+        cColors = off(sCustom, "BodyColors"); cSlot = off(sColor, "MaterialSlotName"); cColor = off(sColor, "Color");
+        cSize = get<int>(sColor + L().struct_child_props + 8); customSize = get<int>(sCustom + L().struct_child_props + 8);
+    }
+    if (fSendCustom) { pSendVehicle = off(fSendCustom, "Vehicle"); pSendCustom = off(fSendCustom, "Customization"); }
+    if (!sCustom || !sColor || !gameplayCDO || !fGetPawn || !fGetPC || !fSendCustom || oCustom < 0 || cColors < 0 || cSlot < 0 || cColor < 0 ||
+        cSize <= 0 || pSendCustom < 0 || pSendVehicle < 0) {
+        MT_LOG("customization calls not found -- plates stay on this machine");
+        oCustom = -1;
     }
     oStaticMesh = off(cMesh, "StaticMesh");
     oEngine = off(cVeh, "EngineComponent");
