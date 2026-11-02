@@ -282,12 +282,13 @@ static bool ownBorder(Plate& p) {
 }
 
 static void dress(Plate& p) {
-    // Asked for each plate: with no plate fitted nothing holds it, and a kept pointer would go stale.
-    cubeMaterial = loadAsset(L"/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial");
     struct { uintptr_t cls, ret; } own = {cMesh, 0};
     api->process_event(p.actor.ptr, fGetComp, &own);
     uintptr_t mesh = own.ret ? get<uintptr_t>(own.ret + oStaticMesh) : 0;
-    if (!mesh || !cubeMaterial) { MT_LOG("no mesh or material on the plate -- left plain"); return; }
+    if (!mesh) return;  // spawned a moment ago: the next pass tries again
+    // Asked for each plate: with no plate fitted nothing holds it, and a kept pointer would go stale.
+    cubeMaterial = loadAsset(L"/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial");
+    if (!cubeMaterial) return;
     double low[3], high[3];
     unsigned char b[0x60] = {0};
     api->process_event(own.ret, fBounds, b);
@@ -441,6 +442,8 @@ static void sendCar(uintptr_t car, const Look& k) {
         memcpy(q + pSetTarget, &target, 4);
         memcpy(q + pSetValue, &value, 4);
         api->process_event(pc.ret, fSetTuning, q);
+        static int said;
+        if (said < 40) { said++; MT_LOG("sent target %d value %.2f, car had %d tunings", target, value, get<int>(car + oTunings + 8)); }
     };
     fields([&](int r, int target, int digits) {
         int v = k.v[r];
@@ -667,6 +670,7 @@ static void tick(void*) {
     if ((int)(now - wearAt) < 0) return;
     wearAt = now + 100;
     uintptr_t mine = editing;
+    static uintptr_t announced;
     if (!mine) {
         for (auto& entry : plates) {
             uintptr_t car = alive(entry.second.actor) ? carOf(entry.first) : 0;
@@ -675,6 +679,10 @@ static void tick(void*) {
             api->process_event(gameplayCDO, fGetPawn, &who);
             if (who.ret == car) { mine = car; break; }
         }
+    }
+    if (mine != announced) {
+        announced = mine;
+        if (mine) MT_LOG("my plate car: %s #%lld", objName(classOf(mine)).c_str(), oId >= 0 ? get<long long>(mine + oId) : 0);
     }
     if (mine && oTunings >= 0 && oId >= 0 && get<long long>(mine + oId) > 0 && (int)(now - sendAt) >= 0) {
         sendAt = now + 300;
@@ -687,6 +695,7 @@ static void tick(void*) {
         Look carried;
         // The plate on the rows is mid-send. Any other car shows what it carries, or else a saved look.
         const Look& k = car && car != mine && readCar(car, carried) ? carried : lookOf(id);
+        if (it->second.half[0] <= 0) dress(it->second);
         wear(it->second, k);
         light(it->second, k, car);
         ++it;
