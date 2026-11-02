@@ -2,7 +2,7 @@
 
 Plugin that puts real text on number plate attachments.
 
-The plates are normal attachments from More Attachments, so you fit and move them with the game's own tools. This plugin adds the lettering, on both faces of the plate.
+The plates are normal attachments from More Attachments, so you fit and move them with the game's own tools. The meshes come with their own artwork, so this plugin covers each one with a blank in your plate colour and adds the lettering on both faces.
 
 Early prototype: one text for every plate, set in `Binaries\Win64\plugins\custom_plates.ini` under `[Plate]` (`Text`, `Size`, `X`, `Z`, `Depth`). Per-car text, letter rows in Tuning and plate templates are planned. Only you see your text.
 
