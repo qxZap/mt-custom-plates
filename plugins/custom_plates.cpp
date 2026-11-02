@@ -666,7 +666,7 @@ static void tick(void*) {
     waiting.clear();
     DWORD now = GetTickCount();
     if (spinRange || !screens.empty()) tickPanel(now);
-    static DWORD wearAt, sendAt;
+    static DWORD wearAt;
     if ((int)(now - wearAt) < 0) return;
     wearAt = now + 100;
     uintptr_t mine = editing;
@@ -683,10 +683,6 @@ static void tick(void*) {
     if (mine != announced) {
         announced = mine;
         if (mine) MT_LOG("my plate car: %s #%lld", objName(classOf(mine)).c_str(), oId >= 0 ? get<long long>(mine + oId) : 0);
-    }
-    if (mine && oTunings >= 0 && oId >= 0 && get<long long>(mine + oId) > 0 && (int)(now - sendAt) >= 0) {
-        sendAt = now + 300;
-        sendCar(mine, lookOf(get<long long>(mine + oId)));
     }
     for (auto it = plates.begin(); it != plates.end();) {
         if (!alive(it->second.actor)) { it = plates.erase(it); continue; }
@@ -828,6 +824,26 @@ static DWORD WINAPI run(LPVOID) {
         oSpinValue = get<int>(range[0] + 57);  // the fourth store: value = min
     } else { MT_LOG("number rows not found -- no plate menu"); canTune = false; }
 
+    // shortcut: finds the calls that can carry a plate to other players. Remove once one is chosen.
+    if (loggingOn()) {
+        static const char* const WANT[] = {"ServerSetPartFloatValue", "ServerSetCustomizationParts", "ServerSetVehicleCustomization",
+            "ServerSetVehicleDecal", "ServerSetDecal", "ServerSetAttachmentPulseValues", "ServerSetParts", "ServerSetPartInventory"};
+        for (int i = 0, n = api->num_objects(); i < n; i++) {
+            uintptr_t o = api->object(i);
+            if (!o || isCDO(o)) continue;
+            std::string nm = objName(o);
+            bool hit = false;
+            for (const char* w : WANT) hit = hit || nm == w;
+            if (!hit) continue;
+            std::string line = objName(get<uintptr_t>(o + L().obj_outer)) + "." + nm + "(";
+            for (uintptr_t f = get<uintptr_t>(o + L().struct_child_props); f; f = get<uintptr_t>(f + L().field_next)) {
+                char at[32];
+                sprintf_s(at, "+%x", get<int>(f + L().field_offset));
+                line += fname(f + L().field_name) + at + " ";
+            }
+            MT_LOG("%s) size %x", line.c_str(), get<int>(o + L().struct_child_props + 8));
+        }
+    }
     std::unordered_map<uintptr_t, bool> plateClass;  // a name test per class, not per object
     for (int beat = 0;; beat++) {
         if (beat % 60 == 0) {  // about two seconds
