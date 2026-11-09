@@ -1,4 +1,4 @@
-// Custom Plates -- license plates you design in the garage, as plugins\mt_plugin_CustomPlates.dll.
+﻿// Custom Plates -- license plates you design in the garage, as plugins\mt_plugin_CustomPlates.dll.
 //
 // The plate itself is a normal attachment (Attachment_SR_Number_Plate_01..08 in More Attachments),
 // so it is placed, moved and removed with the game's own attachment tools. Those meshes are
@@ -18,6 +18,7 @@
 // nothing, and a colour's three bytes hold one packed number, so five entries carry a plate.
 // Players with this plugin read them off the car; to anyone else they are nothing.
 
+#include <algorithm>
 #include <cmath>
 #include <map>
 #include <mutex>
@@ -103,7 +104,7 @@ static void saveLook(int64_t id, const Look& k) {
 static uintptr_t cActor, cWords, cMesh, cVeh, fAdd, fFinish, fMobility, fCollision, fShadow, fSetMesh, fMid, fMidColor;
 static uintptr_t fToText, textCDO, fWords, fWorldSize, fInk, fAlignX, fAlignY, fTall, fRelLoc, fRelScale, fShow, fParent;
 static uintptr_t fToName, stringCDO, fPath, fRef, fLoad, systemCDO, cubeMaterial;
-static uintptr_t fGetPawn, gameplayCDO, fGetMaterial, fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits;
+static uintptr_t fGetPawn, gameplayCDO, fGetMaterial, fGetComp, fBounds, fSetMaterial, fNumMaterials, cLamp, fPower, fLampColor, fLampReach, fLampShadows, fLampUnits, fSourceWidth, fSourceHeight;
 static uintptr_t fGetPC, fSendCustom;
 static int oCustom = -1, cColors, cSlot, cColor, cSize, customSize, pSendVehicle, pSendCustom;
 static uintptr_t editing;  // the car on the plate rows: its design is still being sent
@@ -138,6 +139,16 @@ static uintptr_t loadAsset(const wchar_t* path) {
 }
 
 static Ref refOf(uintptr_t o) { return {o ? get<int>(o + L().obj_index) : 0, o}; }
+
+// The garage screen, caught as the game builds it (its Construct goes through ProcessEvent), so the
+// button does not wait for a scan. Its own lock: the tick makes widgets, and their Construct lands here.
+static uintptr_t gScreenClass;
+static std::mutex builtLock;
+static std::vector<Ref> built;
+static int onBuilt(uintptr_t obj, uintptr_t, void*, void*) {
+    if (gScreenClass && obj && api->is_a(classOf(obj), gScreenClass)) { std::lock_guard<std::mutex> g(builtLock); built.push_back(refOf(obj)); }
+    return 0;
+}
 // In the object table but being destroyed, which alive() alone cannot see.
 static bool usable(const Ref& r) { return alive(r) && !(get<uint32_t>(r.ptr + L().obj_flags) & 0x18000); }
 
@@ -162,6 +173,7 @@ static Box makeBox(uintptr_t actor, uintptr_t mesh) {
     memcpy(m, &mesh, 8);
     api->process_event(c, fSetMesh, m);
     alignas(16) unsigned char f[0x100] = {0};
+    neverCull(c);  // else the maps' cull-distance volumes drop it a little way off
     memcpy(f + off(fFinish, "Component"), &c, 8);
     memcpy(f + off(fFinish, "RelativeTransform"), p + at, 0x60);
     api->process_event(actor, fFinish, f);
@@ -212,20 +224,37 @@ static Ref makeWords(uintptr_t actor, double yaw) {
     memcpy(p + off(fAdd, "Class"), &cWords, 8);
     memcpy(p + at, spin, sizeof spin);
     memcpy(p + at + 0x40, scale, sizeof scale);
+    int deferred = off(fAdd, "bDeferredFinish");
+    if (deferred >= 0) p[deferred] = 1;  // finished below, once it can no longer be distance-culled
     api->process_event(actor, fAdd, p);
     uintptr_t c = 0;
     memcpy(&c, p + off(fAdd, "ReturnValue"), 8);
     if (!c) return {};
+    if (deferred >= 0) {
+        neverCull(c);
+        alignas(16) unsigned char f[0x100] = {0};
+        memcpy(f + off(fFinish, "Component"), &c, 8);
+        memcpy(f + off(fFinish, "RelativeTransform"), p + at, 0x60);
+        api->process_event(actor, fFinish, f);
+    }
     uint8_t centre = 1;  // EHTA_Center, EVRTA_TextCenter
     api->process_event(c, fAlignX, &centre);
     api->process_event(c, fAlignY, &centre);
     return refOf(c);
 }
 
-static Ref makeLamp(uintptr_t actor, double y, double z) {
+// Black and navy give no light. A plate saved with one shines white instead.
+static bool darkLamp(int colour) { return colour == 1 || colour == 8; }
+
+// A plate lamp sits above the plate's top edge, in front of the face, and shines down across
+// it, a narrow spot like a real one: (y, z) is where it sits, aimed at (ty, tz) on the face.
+static Ref makeLamp(uintptr_t actor, double y, double z, double ty, double tz, double length) {
     alignas(16) unsigned char p[0x100] = {0};
     int at = off(fAdd, "RelativeTransform");
-    double spin[4] = {0, 0, 0, 1}, where[3] = {0, y, z}, scale[3] = {1, 1, 1};
+    // A spot shines along its X: yaw towards the face, pitch down onto it (FRotator to FQuat, no roll).
+    double dy = ty - y, dz = tz - z, yaw = atan2(dy, 0.0), pitch = atan2(dz, fabs(dy));
+    double sp = sin(pitch / 2), cp = cos(pitch / 2), sy = sin(yaw / 2), cy = cos(yaw / 2);
+    double spin[4] = {sp * sy, -sp * cy, cp * sy, cp * cy}, where[3] = {0, y, z}, scale[3] = {1, 1, 1};
     memcpy(p + off(fAdd, "Class"), &cLamp, 8);
     memcpy(p + at, spin, sizeof spin);
     memcpy(p + at + 0x20, where, sizeof where);
@@ -237,13 +266,17 @@ static Ref makeLamp(uintptr_t actor, double y, double z) {
     if (!c) return {};
     uint8_t movable = 2, lumens = 2;
     unsigned char shadows[8] = {0};
-    float reach = 45, power = 25;
+    // A strip as long as the plate, low: the whole face lit evenly, not a bright spot in its middle.
+    float reach = 30, power = 0.75f, wide = (float)length, tall = 1.5f;
     api->process_event(c, fMobility, &movable);
     api->process_event(c, fLampShadows, shadows);
     api->process_event(c, fLampUnits, &lumens);
     api->process_event(c, fLampReach, &reach);
     api->process_event(c, fPower, &power);
+    if (fSourceWidth) api->process_event(c, fSourceWidth, &wide);
+    if (fSourceHeight) api->process_event(c, fSourceHeight, &tall);
     alignas(16) unsigned char f[0x100] = {0};
+    neverCull(c);  // else the maps' cull-distance volumes drop it a little way off
     memcpy(f + off(fFinish, "Component"), &c, 8);
     memcpy(f + off(fFinish, "RelativeTransform"), p + at, 0x60);
     api->process_event(actor, fFinish, f);
@@ -301,7 +334,8 @@ static void dress(Plate& p) {
     p.band[1] = makeBox(p.actor.ptr, mesh);
     for (int side = 0; side < 2; side++) {
         for (int i = 0; i < 4; i++) p.text[side][i] = makeWords(p.actor.ptr, side ? -90 : 90);
-        p.lamp[side] = makeLamp(p.actor.ptr, (side ? -1 : 1) * (p.half[1] + 2.5), p.half[2] + 1.5);
+        double face = (side ? -1 : 1) * p.half[1];
+        p.lamp[side] = makeLamp(p.actor.ptr, face + (side ? -3 : 3), p.half[2] + 1, face, 0, p.half[0] * 2);
         show(p.lamp[side], false);
     }
     p.lit = -1;
@@ -322,7 +356,7 @@ static void light(Plate& p, const Look& k, uintptr_t car) {
     for (const Ref& c : p.lamp) {
         show(c, want != 0);
         if (!want || !alive(c)) continue;
-        unsigned rgb = PALETTE[want - 1].rgb;
+        unsigned rgb = darkLamp(want - 1) ? PALETTE[0].rgb : PALETTE[want - 1].rgb;
         struct { float rgba[4]; bool srgb; } tint = {{((rgb >> 16) & 255) / 255.0f, ((rgb >> 8) & 255) / 255.0f, (rgb & 255) / 255.0f, 1}, true};
         api->process_event(c.ptr, fLampColor, &tint);
     }
@@ -432,7 +466,7 @@ static bool readCar(uintptr_t car, Look& out) {
     if (oCustom < 0) return false;
     uintptr_t d = get<uintptr_t>(car + oCustom + cColors);
     int n = get<int>(car + oCustom + cColors + 8), in[PACKED], got = 0;
-    for (int i = 0; d && i < n && i < 64; i++) {
+    for (int i = 0; d && i < n && i < 200; i++) {
         uintptr_t e = d + (uintptr_t)i * cSize;
         int at = carried(get<uint64_t>(e + cSlot));
         if (at < 0) continue;
@@ -453,8 +487,8 @@ static void sendCar(uintptr_t car, const Look& k) {
     pack(k, want);
     uintptr_t d = get<uintptr_t>(car + oCustom + cColors);
     int n = get<int>(car + oCustom + cColors + 8), have = 0;
-    static unsigned char list[0x40 * 72];
-    if (n > 64 || cSize > 0x40) return;
+    static unsigned char list[0x40 * 220];  // the car's list is shared: plates, the tune, Attachment Tweaks' lights
+    if (n > 200 || cSize > 0x40) return;
     bool same = true;
     int seen = 0;
     for (int i = 0; d && i < n; i++) {
@@ -624,6 +658,7 @@ static void tickPanel(DWORD now) {
     if (id <= 0) return;
     if (panel.screen.ptr != screen) {
         if (panel.dirty) saveLook(panel.id, lookOf(panel.id));
+        if (panel.open && alive(panel.screen)) closeRows();  // else they stay on the old screen beside new ones
         panel = {};
         panel.screen = refOf(screen);
     }
@@ -648,6 +683,12 @@ static void tickPanel(DWORD now) {
             int v = fromSpin(get<float>(panel.rows[i].spin + oSpinValue));
             // Held at the end of its range the spin box keeps writing its own number over the row.
             if (v == k.v[i]) { showRow(i, k); continue; }
+            if (i == R_LAMPCOLOR) {  // a lamp does not shine black: step over the dark colours, the way the arrow went
+                int step = v > k.v[i] ? 1 : -1;
+                while (v >= 0 && v <= ROWS[i].top && darkLamp(v)) v += step;
+                if (v < 0 || v > ROWS[i].top) v = k.v[i];
+                spinSet(panel.rows[i].spin, toSpin(v));
+            }
             k.v[i] = v < 0 ? 0 : v > ROWS[i].top ? ROWS[i].top : v;
             panel.dirty = now;
             showRow(i, k);
@@ -657,7 +698,20 @@ static void tickPanel(DWORD now) {
         }
         return;
     }
-    if (childIndex(box, panel.button) >= 0) {
+    if (int at = childIndex(box, panel.button); at >= 0) {
+        // Other plugins (ECU Tuning) append their own menu button in whatever order the ticks
+        // ran, so the two swapped places. Plates always goes last: below any button after it.
+        int count = 0;
+        api->process_event(box, fChildCount, &count);
+        struct { int index; uintptr_t ret; } last = {count - 1, 0};
+        if (at < count - 1) api->process_event(box, fChildAt, &last);
+        if (last.ret && last.ret != panel.button && isA(last.ret, cButtonBase)) {
+            api->process_event(panel.button, fRemove, nullptr);
+            struct { uintptr_t content, slot; } add = {panel.button, 0};
+            api->process_event(box, fAddChild, &add);
+            float pad[4] = {5, 5, 5, 5};
+            if (add.slot) api->process_event(add.slot, fPadding, pad);
+        }
         if (panel.labelFrames > 0) {
             panel.labelFrames--;
             for (int at : {oBtnName, oBtnRich}) {
@@ -670,9 +724,30 @@ static void tickPanel(DWORD now) {
     }
     struct { int index; uintptr_t ret; } first = {0, 0};
     api->process_event(box, fChildAt, &first);
-    if (!isA(first.ret, cButtonBase) || !cButton) { panel.button = 0; return; }
+    if (!isA(first.ret, cButtonBase) || !cButton) {
+        if (panel.button) MT_LOG("plates menu %lu: lost the button", now);
+        panel.button = 0;
+        return;
+    }
+    // The game's buttons hidden: another plugin's rows are open (ECU Tuning), and a button made now
+    // would sit among them. Made once they close.
+    if (!flag(first.ret, fIsVisible)) return;
+    // A button made before, still in the list: the panel lost track of it (another screen, the
+    // list showing something else a moment), and making one more is what put two in the menu.
+    static std::vector<Ref> made;
+    for (auto& r : made)
+        if (alive(r) && childIndex(box, r.ptr) >= 0) {
+            panel.button = r.ptr;
+            panel.inner = get<uintptr_t>(r.ptr + oBtnInner);
+            panel.buttonHeld = false;
+            MT_LOG("plates menu %lu: the button was still in the list, kept it", now);
+            return;
+        }
+    made.erase(std::remove_if(made.begin(), made.end(), [](const Ref& r) { return !alive(r); }), made.end());
     panel.button = create(screen, cButton, box);
     if (!panel.button) return;
+    made.push_back(refOf(panel.button));
+    MT_LOG("plates menu %lu: button made on screen %p", now, (void*)screen);
     unsigned char p[0x40] = {0};
     FStr s = str(L"License Plate");
     memcpy(p + pTextIn, &s, sizeof s);
@@ -681,6 +756,33 @@ static void tickPanel(DWORD now) {
     panel.labelFrames = LABEL_FRAMES;
     panel.inner = get<uintptr_t>(panel.button + oBtnInner);
     panel.buttonHeld = false;
+}
+
+// A plate nobody has designed reads the player's name, as much of it as a plate can show: A-Z,
+// 0-9, '-' and spaces, upper case, nine at most. Unless [Plate] Text was changed from QX 123.
+static bool nameDone;
+static uintptr_t fPlayerName;
+static int oPlayerState = -1;
+static void nameDefault(uintptr_t context) {
+    if (nameDone || !fPlayerName || oPlayerState < 0 || !context) return;
+    if (iniGet(L"custom_plates.ini", L"Plate", L"Text") != L"QX 123") { nameDone = true; return; }
+    struct { uintptr_t context; int index; uintptr_t ret; } pc = {context, 0, 0};
+    api->process_event(gameplayCDO, fGetPC, &pc);
+    uintptr_t state = pc.ret ? get<uintptr_t>(pc.ret + oPlayerState) : 0;
+    if (!state) return;  // not in a world yet: ask again next frame
+    struct { const wchar_t* data; int num, max; } who = {nullptr, 0, 0};
+    api->process_event(state, fPlayerName, &who);
+    std::wstring plate;
+    for (int i = 0; who.data && i < who.num && plate.size() < 9; i++) {
+        wchar_t c = towupper(who.data[i]);
+        if (c && wcschr(ALPHABET, c) && !(c == L' ' && (plate.empty() || plate.back() == L' '))) plate += c;
+    }
+    while (!plate.empty() && plate.back() == L' ') plate.pop_back();
+    nameDone = true;
+    if (plate.empty()) return;  // nothing a plate can show: QX 123 stays
+    for (int i = 0; i < 9; i++) base.v[R_CHAR + i] = i < (int)plate.size() ? (int)(wcschr(ALPHABET, plate[i]) - ALPHABET) : 0;
+    looks.clear();  // undesigned cars were cached with QX 123; designed ones reload from the ini
+    MT_LOG("plates default to the player's name: %ls", plate.c_str());
 }
 
 static void tick(void*) {
@@ -713,6 +815,9 @@ static void tick(void*) {
     static DWORD wearAt, sendAt;
     if ((int)(now - wearAt) < 0) return;
     wearAt = now + 100;
+    if (!nameDone)
+        for (auto& entry : plates)
+            if (alive(entry.second.actor)) { nameDefault(entry.second.actor.ptr); break; }
     uintptr_t mine = editing;
     static uintptr_t announced;
     if (!mine) {
@@ -743,6 +848,16 @@ static void tick(void*) {
         wear(it->second, k);
         light(it->second, k, car);
         ++it;
+    }
+}
+
+// The tick is queued from a thread of its own: the full scan takes about a second, and queuing from the
+// scanning thread stalled the tick for that second every two.
+static DWORD WINAPI pump(LPVOID) {
+    for (int beat = 1;; beat++) {
+        
+        if (api->game_thread_ready() && !InterlockedCompareExchange(&queued, 1, 0)) api->run_on_game_thread(tick, nullptr);
+        Sleep(33);
     }
 }
 
@@ -803,7 +918,10 @@ static DWORD WINAPI run(LPVOID) {
     fSetMaterial = api->find_object("Function", "SetMaterial", "PrimitiveComponent");
     fGetMaterial = api->find_object("Function", "GetMaterial", "PrimitiveComponent");
     fNumMaterials = api->find_object("Function", "GetNumMaterials", "PrimitiveComponent");
-    cLamp = api->find_object("Class", "PointLightComponent", "/Script/Engine");
+    cLamp = api->find_object("Class", "RectLightComponent", "/Script/Engine");
+    fSourceWidth = api->find_object("Function", "SetSourceWidth", "RectLightComponent");
+    fSourceHeight = api->find_object("Function", "SetSourceHeight", "RectLightComponent");
+    if (!cLamp) cLamp = api->find_object("Class", "SpotLightComponent", "/Script/Engine");  // a narrow spot if the strip is not there
     fPower = either("SetIntensity", "LightComponent", "LocalLightComponent");
     fLampColor = either("SetLightColor", "LightComponent", "LightComponentBase");
     fLampReach = either("SetAttenuationRadius", "LocalLightComponent", "PointLightComponent");
@@ -820,6 +938,9 @@ static DWORD WINAPI run(LPVOID) {
     gameplayCDO = api->find_object("GameplayStatics", "Default__GameplayStatics", "/Script/Engine");
     fGetPawn = api->find_object("Function", "GetPlayerPawn", "GameplayStatics");
     fGetPC = api->find_object("Function", "GetPlayerController", "GameplayStatics");
+    fPlayerName = api->find_object("Function", "GetPlayerName", "PlayerState");
+    if (uintptr_t cController = api->find_object("Class", "Controller", "/Script/Engine")) oPlayerState = off(cController, "PlayerState");
+    if (!fPlayerName || oPlayerState < 0) MT_LOG("no player name found -- plates default to [Plate] Text");
     fSendCustom = api->find_object("Function", "ServerSetVehicleCustomization", "MotorTownPlayerController");
     oCustom = off(cVeh, "Customization");
     if (sCustom && sColor) {
@@ -875,14 +996,53 @@ static DWORD WINAPI run(LPVOID) {
         spinSet = (decltype(spinSet))value[0];
         oSpinValue = get<int>(range[0] + 57);  // the fourth store: value = min
     } else { MT_LOG("number rows not found -- no plate menu"); canTune = false; }
+    MT_LOG("plate menu %s (screen %d child %d row %d spin %d button %d text %d)", canTune ? "ready" : "OFF -- a piece of the Tuning screen is missing",
+           cScreen != 0, cChild != 0, cRowBase != 0, cSpinRow != 0, cButtonBase != 0, cTextBlock != 0);
+    static const char* kConstruct[] = {"Construct"};
+    if (canTune) { gScreenClass = cScreen; MT_LOG("garage screen watch %s", api->watch_functions(kConstruct, 1, onBuilt, nullptr) ? "on" : "OFF -- scans only"); }
 
     std::unordered_map<uintptr_t, bool> plateClass;  // a name test per class, not per object
+    // The game builds a new garage screen each time the menu opens. Between the full scans a quick
+    // one looks for just the screen's own class (learnt from its default object), one compare an object.
+    std::vector<uintptr_t> screenClasses;
+    CloseHandle(CreateThread(nullptr, 0, pump, nullptr, 0, nullptr));
     for (int beat = 0;; beat++) {
+        {
+            std::vector<Ref> got;
+            { std::lock_guard<std::mutex> g(builtLock); got.swap(built); }
+            if (!got.empty()) {
+                if (canTune && !cButton) {
+                    cSetting = api->find_object("WidgetBlueprintGeneratedClass", "W_Setting_C", "/Game/UI/Component/W_Setting");
+                    cButton = api->find_object("WidgetBlueprintGeneratedClass", "W_Button_C", "/Game/UI/Button/W_Button");
+                    if (!cSetting) cButton = 0;
+                }
+                std::lock_guard<std::mutex> g(lock);
+                for (auto& r : got)
+                    if (std::none_of(screens.begin(), screens.end(), [&](const Ref& s) { return s.ptr == r.ptr; })) {
+                        screens.push_back(r);
+                        MT_LOG("plates menu %lu: garage screen %p built", GetTickCount(), (void*)r.ptr);
+                    }
+            }
+        }
+        if (beat % 60 != 0 && beat % 3 == 0 && cButton && !screenClasses.empty()) {  // about 100 ms
+            std::vector<Ref> found;
+            for (int i = 0, n = api->num_objects(); i < n; i++) {
+                uintptr_t o = api->object(i);
+                if (o && std::find(screenClasses.begin(), screenClasses.end(), classOf(o)) != screenClasses.end() && !isCDO(o)) found.push_back({i, o});
+            }
+            std::lock_guard<std::mutex> g(lock);
+            for (auto& r : found)
+                if (std::none_of(screens.begin(), screens.end(), [&](const Ref& s) { return s.ptr == r.ptr; })) screens.push_back(r);
+        }
         if (beat % 60 == 0) {  // about two seconds
             std::vector<Ref> fresh, w;
             for (int i = 0, n = api->num_objects(); i < n; i++) {
                 uintptr_t o = api->object(i);
-                if (!o || isCDO(o)) continue;
+                if (!o) continue;
+                if (isCDO(o)) {  // until the screen's class is known (a screen found below teaches it too)
+                    if (canTune && screenClasses.empty() && classOf(o) != cScreen && api->is_a(classOf(o), cScreen)) screenClasses.push_back(classOf(o));
+                    continue;
+                }
                 uintptr_t k = classOf(o);
                 if (canTune && api->is_a(k, cScreen)) { w.push_back({i, o}); continue; }
                 auto known = plateClass.find(k);
@@ -893,13 +1053,15 @@ static DWORD WINAPI run(LPVOID) {
                 cSetting = api->find_object("WidgetBlueprintGeneratedClass", "W_Setting_C", "/Game/UI/Component/W_Setting");
                 cButton = api->find_object("WidgetBlueprintGeneratedClass", "W_Button_C", "/Game/UI/Button/W_Button");
                 if (!cSetting) cButton = 0;
+                MT_LOG("garage screen seen: W_Setting %s, W_Button %s", cSetting ? "found" : "MISSING", cButton ? "found" : "MISSING");
             }
+            for (auto& r : w)
+                if (std::find(screenClasses.begin(), screenClasses.end(), classOf(r.ptr)) == screenClasses.end()) screenClasses.push_back(classOf(r.ptr));
             std::lock_guard<std::mutex> g(lock);
             screens.swap(w);
             for (auto& r : fresh)
                 if (!plates.count(r.ptr)) waiting.push_back(r);
         }
-        if (api->game_thread_ready() && !InterlockedCompareExchange(&queued, 1, 0)) api->run_on_game_thread(tick, nullptr);
         Sleep(33);
     }
 }
